@@ -174,9 +174,9 @@ class LogHandlerSettings(LogHandlerSettingsBase):
         },
     )
     ssh_username: Optional[str] = field(
-        default=None,
+        default_factory=lambda: os.environ.get("USER"),
         metadata={
-            "help": "SSH username",
+            "help": "SSH username (defaults to the USER environment variable)",
             "env_var": True,
         },
     )
@@ -473,7 +473,10 @@ class LogHandler(LogHandlerBase):
         if not self.settings.ssh_host:
             raise ValueError("ssh_host is required when use_ssh_tunnel is true")
         if not self.settings.ssh_username:
-            raise ValueError("ssh_username is required when use_ssh_tunnel is true")
+            raise ValueError(
+                "ssh_username is required when use_ssh_tunnel is true; "
+                "set it explicitly or ensure the USER environment variable is set"
+            )
         if not self.settings.ssh_private_key:
             raise ValueError("ssh_private_key is required when use_ssh_tunnel is true")
         if self.settings.ssh_connect_timeout <= 0:

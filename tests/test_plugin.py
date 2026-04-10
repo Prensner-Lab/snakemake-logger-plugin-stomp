@@ -108,6 +108,18 @@ def test_settings_defaults():
     assert settings.reconnect_attempts == 3
 
 
+def test_ssh_username_defaults_to_user_env_var(monkeypatch):
+    monkeypatch.setenv("USER", "workflow_user")
+    settings = LogHandlerSettings()
+    assert settings.ssh_username == "workflow_user"
+
+
+def test_ssh_username_is_none_when_user_env_var_unset(monkeypatch):
+    monkeypatch.delenv("USER", raising=False)
+    settings = LogHandlerSettings()
+    assert settings.ssh_username is None
+
+
 def test_consumer_heartbeat_interval_must_be_non_negative():
     common = MockOutputSettings()
     settings = LogHandlerSettings(consumer_heartbeat_interval=-1)
@@ -121,6 +133,34 @@ def test_ssh_requires_settings_when_enabled():
     settings = LogHandlerSettings(use_ssh_tunnel=True)
 
     with pytest.raises(ValueError, match="ssh_host is required"):
+        LogHandler(common_settings=common, settings=settings)
+
+
+def test_ssh_username_uses_user_env_var_when_not_set_explicitly(monkeypatch, tmp_path):
+    """When ssh_username is not provided, USER env var should be used automatically."""
+    monkeypatch.setenv("USER", "env_user")
+    key_file = tmp_path / "id_rsa"
+    key_file.write_text("key")
+    common = MockOutputSettings()
+    settings = LogHandlerSettings(
+        use_ssh_tunnel=True,
+        ssh_host="jump.example.com",
+        ssh_private_key=str(key_file),
+    )
+    # ssh_username should have been populated from USER; validation passes username check
+    assert settings.ssh_username == "env_user"
+
+
+def test_ssh_raises_when_username_unresolvable(monkeypatch):
+    """When USER is not set and ssh_username is not provided, raise a clear error."""
+    monkeypatch.delenv("USER", raising=False)
+    common = MockOutputSettings()
+    settings = LogHandlerSettings(
+        use_ssh_tunnel=True,
+        ssh_host="jump.example.com",
+        ssh_username=None,
+    )
+    with pytest.raises(ValueError, match="USER environment variable"):
         LogHandler(common_settings=common, settings=settings)
 
 
