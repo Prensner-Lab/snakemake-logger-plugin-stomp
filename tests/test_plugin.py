@@ -103,6 +103,9 @@ def test_settings_defaults():
     assert settings.password is None
     assert settings.stream_filter_by_workflow is False
     assert settings.consumer_heartbeat_interval == 0
+    assert settings.use_ssh_tunnel is False
+    assert settings.ssh_port == 22
+    assert settings.reconnect_attempts == 3
 
 
 def test_consumer_heartbeat_interval_must_be_non_negative():
@@ -110,6 +113,27 @@ def test_consumer_heartbeat_interval_must_be_non_negative():
     settings = LogHandlerSettings(consumer_heartbeat_interval=-1)
 
     with pytest.raises(ValueError, match="consumer_heartbeat_interval must be >= 0"):
+        LogHandler(common_settings=common, settings=settings)
+
+
+def test_ssh_requires_settings_when_enabled():
+    common = MockOutputSettings()
+    settings = LogHandlerSettings(use_ssh_tunnel=True)
+
+    with pytest.raises(ValueError, match="ssh_host is required"):
+        LogHandler(common_settings=common, settings=settings)
+
+
+def test_ssh_requires_existing_private_key_file(tmp_path):
+    common = MockOutputSettings()
+    settings = LogHandlerSettings(
+        use_ssh_tunnel=True,
+        ssh_host="jump.example.com",
+        ssh_username="alice",
+        ssh_private_key=str(tmp_path / "missing.key"),
+    )
+
+    with pytest.raises(ValueError, match="ssh_private_key must point to an existing"):
         LogHandler(common_settings=common, settings=settings)
 
 
@@ -232,6 +256,68 @@ def test_heartbeat_configuration_passed(monkeypatch):
     LogHandler(common_settings=common, settings=settings)
     
     assert conn_calls[0]["heartbeats"] == (5000, 15000)
+
+
+def test_ssh_tunnel_endpoint_used_for_stomp_connection(monkeypatch, tmp_path):
+    common = MockOutputSettings()
+    conn_calls = []
+    tunnel_calls = []
+
+    class DummyTunnelManager:
+        def __init__(self, **kwargs):
+            tunnel_calls.append(("init", kwargs))
+
+        def connect(self):
+            tunnel_calls.append(("connect", None))
+            return ("127.0.0.1", 19001)
+
+        def close(self):
+            tunnel_calls.append(("close", None))
+
+    def capture_connection(*args, **kwargs):
+        conn_calls.append(kwargs)
+        return DummyConnection(*args, **kwargs)
+
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("dummy-private-key")
+
+    monkeypatch.setattr("snakemake_logger_plugin_stomp.SSHTunnelManager", DummyTunnelManager)
+    monkeypatch.setattr("stomp.Connection", capture_connection)
+
+    settings = LogHandlerSettings(
+        use_ssh_tunnel=True,
+        ssh_host="jump.example.com",
+        ssh_username="alice",
+        ssh_private_key=str(key_file),
+    )
+    handler = LogHandler(common_settings=common, settings=settings)
+
+    assert conn_calls[0]["host_and_ports"] == [("127.0.0.1", 19001)]
+    assert tunnel_calls[1][0] == "connect"
+
+    handler.close()
+    assert tunnel_calls[-1][0] == "close"
+
+
+def test_send_recovers_connection_when_disconnected(monkeypatch):
+    common = MockOutputSettings()
+    handler = LogHandler(common_settings=common, settings=LogHandlerSettings())
+    handler.connection = DummyConnection()
+    handler.connection._connected = False
+
+    recover_calls = []
+
+    def fake_recover():
+        recover_calls.append(True)
+        handler.connection._connected = True
+        return True
+
+    monkeypatch.setattr(handler, "_recover_connection", fake_recover)
+
+    handler._send_to_broker({"event_type": "test"})
+
+    assert len(recover_calls) == 1
+    assert len(handler.connection.sent) == 1
 
 def test_send_when_not_connected():
     """Verify _send_to_broker skips gracefully when disconnected."""

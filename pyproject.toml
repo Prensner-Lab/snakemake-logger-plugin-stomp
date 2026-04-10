@@ -22,6 +22,7 @@ dependencies = [
     "snakemake-interface-common>=1.22.0,<2",
     "snakemake-interface-logger-plugins>=2.0.0,<3",
     "stomp-py>=8.2.0",
+    "paramiko>=3.4.0",
 ]
 
 [[project.authors]]

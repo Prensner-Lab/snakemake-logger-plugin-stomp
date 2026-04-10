@@ -14,6 +14,7 @@ from pathlib import Path
 import socket
 import ssl
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from snakemake_interface_logger_plugins.common import LogEvent
 from snakemake_interface_logger_plugins.settings import LogHandlerSettingsBase
 
 from snakemake_logger_plugin_stomp.formatters import DefaultJSONFormatter
+from snakemake_logger_plugin_stomp.ssh_tunnel import SSHTunnelManager
 
 
 @dataclass
@@ -150,6 +152,83 @@ class LogHandlerSettings(LogHandlerSettingsBase):
             "env_var": False,
         },
     )
+    use_ssh_tunnel: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable SSH tunnel transport between logger and STOMP broker",
+            "env_var": False,
+        },
+    )
+    ssh_host: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SSH jump host used for tunnel",
+            "env_var": False,
+        },
+    )
+    ssh_port: int = field(
+        default=22,
+        metadata={
+            "help": "SSH server port",
+            "env_var": False,
+        },
+    )
+    ssh_username: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SSH username",
+            "env_var": True,
+        },
+    )
+    ssh_private_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to SSH private key for tunnel authentication",
+            "env_var": False,
+        },
+    )
+    ssh_key_passphrase: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Passphrase for SSH private key",
+            "env_var": True,
+        },
+    )
+    ssh_connect_timeout: int = field(
+        default=10,
+        metadata={
+            "help": "SSH connect timeout in seconds",
+            "env_var": False,
+        },
+    )
+    ssh_local_bind_port: int = field(
+        default=0,
+        metadata={
+            "help": "Local port for SSH tunnel (0 to auto-select)",
+            "env_var": False,
+        },
+    )
+    reconnect_attempts: int = field(
+        default=3,
+        metadata={
+            "help": "Number of connection recovery attempts after send failures",
+            "env_var": False,
+        },
+    )
+    reconnect_initial_backoff_seconds: float = field(
+        default=1.0,
+        metadata={
+            "help": "Initial reconnection backoff delay in seconds",
+            "env_var": False,
+        },
+    )
+    reconnect_max_backoff_seconds: float = field(
+        default=8.0,
+        metadata={
+            "help": "Maximum reconnection backoff delay in seconds",
+            "env_var": False,
+        },
+    )
 
 
 class StompConnectionListener(stomp.ConnectionListener):
@@ -209,6 +288,9 @@ class LogHandler(LogHandlerBase):
 
         # STOMP connection handle
         self.connection = None
+        self._ssh_tunnel_manager = None
+        self._connection_host = self.settings.host
+        self._connection_port = self.settings.port
         self._stream_declared = False
         self._consumer_heartbeat_stop_event = threading.Event()
         self._consumer_heartbeat_thread = None
@@ -225,6 +307,8 @@ class LogHandler(LogHandlerBase):
 
         self._validate_stream_settings()
         self._validate_consumer_heartbeat_settings()
+        self._validate_reconnect_settings()
+        self._validate_ssh_settings()
 
         # Load and initialize the configured formatter
         self.formatter_instance = self._init_formatter()
@@ -269,15 +353,42 @@ class LogHandler(LogHandlerBase):
             )
             return DefaultJSONFormatter()
 
-    def _connect_to_broker(self):
+    def _resolve_broker_endpoint(self) -> tuple[str, int]:
+        """Resolve broker endpoint, optionally by creating an SSH tunnel."""
+        if not self.settings.use_ssh_tunnel:
+            return self.settings.host, self.settings.port
+
+        if self._ssh_tunnel_manager is None:
+            self._ssh_tunnel_manager = SSHTunnelManager(
+                ssh_host=self.settings.ssh_host,
+                ssh_port=self.settings.ssh_port,
+                ssh_username=self.settings.ssh_username,
+                ssh_private_key=self.settings.ssh_private_key,
+                ssh_key_passphrase=self.settings.ssh_key_passphrase,
+                remote_host=self.settings.host,
+                remote_port=self.settings.port,
+                local_bind_port=self.settings.ssh_local_bind_port,
+                connect_timeout=self.settings.ssh_connect_timeout,
+                logger=self._internal_logger,
+            )
+
+        endpoint = self._ssh_tunnel_manager.connect()
+        self._internal_logger.info(
+            "[STOMP] SSH tunnel established: "
+            f"127.0.0.1:{endpoint[1]} -> {self.settings.host}:{self.settings.port}"
+        )
+        return endpoint
+
+    def _connect_to_broker(self, raise_on_error: bool = False) -> bool:
         """Establish connection to STOMP message broker.
 
         Configures SSL if enabled and sets up connection listener for
         error handling. Connection errors are logged but don't halt execution.
         """
-        hosts = [(self.settings.host, self.settings.port)]
-
         try:
+            self._connection_host, self._connection_port = self._resolve_broker_endpoint()
+            hosts = [(self._connection_host, self._connection_port)]
+
             # Create STOMP connection with heartbeat configuration
             self.connection = stomp.Connection(
                 host_and_ports=hosts,
@@ -309,17 +420,24 @@ class LogHandler(LogHandlerBase):
             )
 
             self._internal_logger.info(
-                f"[STOMP] Connected to {self.settings.host}:{self.settings.port}"
+                f"[STOMP] Connected to {self._connection_host}:{self._connection_port}"
             )
+            return True
 
         except (ConnectionError, OSError, Exception) as e:
             self._internal_logger.error(
                 f"[STOMP] Failed to connect to {self.settings.host}:{self.settings.port}: {e}"
             )
-            if self.settings.fail_on_connection_error:
+            if self._ssh_tunnel_manager is not None:
+                self._ssh_tunnel_manager.close()
+            self._ssh_tunnel_manager = None
+            self.connection = None
+
+            if self.settings.fail_on_connection_error or raise_on_error:
                 raise RuntimeError(
                     f"STOMP logging required but broker unavailable: {e}"
                 ) from e
+            return False
 
     def _validate_stream_settings(self) -> None:
         """Validate RabbitMQ stream-specific settings."""
@@ -330,6 +448,70 @@ class LogHandler(LogHandlerBase):
         """Validate consumer heartbeat settings."""
         if self.settings.consumer_heartbeat_interval < 0:
             raise ValueError("consumer_heartbeat_interval must be >= 0")
+
+    def _validate_reconnect_settings(self) -> None:
+        """Validate reconnection backoff settings."""
+        if self.settings.reconnect_attempts < 0:
+            raise ValueError("reconnect_attempts must be >= 0")
+        if self.settings.reconnect_initial_backoff_seconds <= 0:
+            raise ValueError("reconnect_initial_backoff_seconds must be > 0")
+        if self.settings.reconnect_max_backoff_seconds <= 0:
+            raise ValueError("reconnect_max_backoff_seconds must be > 0")
+        if (
+            self.settings.reconnect_initial_backoff_seconds
+            > self.settings.reconnect_max_backoff_seconds
+        ):
+            raise ValueError(
+                "reconnect_initial_backoff_seconds must be <= reconnect_max_backoff_seconds"
+            )
+
+    def _validate_ssh_settings(self) -> None:
+        """Validate SSH tunnel settings when enabled."""
+        if not self.settings.use_ssh_tunnel:
+            return
+
+        if not self.settings.ssh_host:
+            raise ValueError("ssh_host is required when use_ssh_tunnel is true")
+        if not self.settings.ssh_username:
+            raise ValueError("ssh_username is required when use_ssh_tunnel is true")
+        if not self.settings.ssh_private_key:
+            raise ValueError("ssh_private_key is required when use_ssh_tunnel is true")
+        if self.settings.ssh_connect_timeout <= 0:
+            raise ValueError("ssh_connect_timeout must be > 0")
+        if self.settings.ssh_local_bind_port < 0:
+            raise ValueError("ssh_local_bind_port must be >= 0")
+        if self.settings.ssh_port <= 0:
+            raise ValueError("ssh_port must be > 0")
+
+        key_path = Path(self.settings.ssh_private_key)
+        if not key_path.exists() or not key_path.is_file():
+            raise ValueError(
+                "ssh_private_key must point to an existing private key file"
+            )
+
+    def _recover_connection(self) -> bool:
+        """Attempt to recover the broker connection with bounded exponential backoff."""
+        attempts = self.settings.reconnect_attempts
+        if attempts == 0:
+            return False
+
+        backoff = self.settings.reconnect_initial_backoff_seconds
+        max_backoff = self.settings.reconnect_max_backoff_seconds
+
+        for attempt in range(1, attempts + 1):
+            self._internal_logger.warning(
+                f"[STOMP] Attempting connection recovery ({attempt}/{attempts})"
+            )
+            if self._connect_to_broker(raise_on_error=False):
+                self._internal_logger.info("[STOMP] Connection recovery succeeded")
+                return True
+
+            if attempt < attempts:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+        self._internal_logger.error("[STOMP] Connection recovery failed")
+        return False
 
     def _start_consumer_heartbeat_loop(self) -> None:
         """Start background loop that emits consumer heartbeat events."""
@@ -419,10 +601,14 @@ class LogHandler(LogHandlerBase):
         """
         # Skip if not connected
         if not self.connection or not self.connection.is_connected():
-            self._internal_logger.debug(
-                "[STOMP] Skipping send - not connected to broker"
+            self._internal_logger.warning(
+                "[STOMP] Not connected to broker; attempting recovery before send"
             )
-            return
+            if not self._recover_connection():
+                self._internal_logger.debug(
+                    "[STOMP] Skipping send - unable to recover broker connection"
+                )
+                return
 
         try:
             # Send message with JSON body and appropriate headers
@@ -524,6 +710,16 @@ class LogHandler(LogHandlerBase):
                 self._internal_logger.info("[STOMP] Disconnected from broker")
             except Exception as e:
                 self._internal_logger.error(f"[STOMP] Error during disconnect: {e}")
+
+        if self._ssh_tunnel_manager is not None:
+            try:
+                self._ssh_tunnel_manager.close()
+            except Exception as e:
+                self._internal_logger.error(
+                    f"[STOMP] Error during SSH tunnel cleanup: {e}"
+                )
+            finally:
+                self._ssh_tunnel_manager = None
 
     @property
     def writes_to_stream(self) -> bool:
