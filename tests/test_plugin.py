@@ -147,8 +147,11 @@ def test_ssh_username_uses_user_env_var_when_not_set_explicitly(monkeypatch, tmp
         ssh_host="jump.example.com",
         ssh_private_key=str(key_file),
     )
-    # ssh_username should have been populated from USER; validation passes username check
+    # ssh_username should have been populated from USER
     assert settings.ssh_username == "env_user"
+    # LogHandler should initialize successfully: settings validation passes
+    handler = LogHandler(common_settings=common, settings=settings)
+    assert handler.settings.ssh_username == "env_user"
 
 
 def test_ssh_raises_when_username_unresolvable(monkeypatch):
